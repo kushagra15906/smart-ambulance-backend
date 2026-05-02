@@ -1,257 +1,394 @@
 """
-camera_pipeline.py — Real-Time Camera Detection Pipeline
-===========================================================
-Captures frames from webcam/RTSP stream using OpenCV.
-Runs dual YOLO detection + feeds results to ML history.
-Designed to run as a background thread.
+camera_pipeline.py
+==================
+Lives in:  ambulance_server/camera_pipeline.py
 
-Usage:
-  pipeline = CameraPipeline(signal_id="S1", source=0)
-  pipeline.start()
-  result = pipeline.latest_result()
-  pipeline.stop()
+Connects ESP32-CAM raw frames to your existing DualYOLODetector.
+
+Interface used from yolo_detector.py:
+    from yolo_detector import detector          ← singleton DualYOLODetector
+    detector.load_models()                      ← call once at startup
+    result = detector.detect_all(rgb_frame)     ← run both models
+    result = detector.detect_ambulance(frame)   ← ambulance only
+    result = detector.detect_vehicles(frame)    ← vehicle count only
+
+    detect_ambulance() returns:
+        {
+            "detected"       : bool,
+            "confidence"     : float,
+            "bbox"           : [x1, y1, x2, y2] or [],
+            "annotated_frame": np.ndarray,
+        }
+
+    detect_vehicles() returns:
+        {
+            "total_count"    : int,
+            "by_class"       : {"car": 2, "truck": 1, ...},
+            "detections"     : [...],
+            "annotated_frame": np.ndarray,
+        }
+
+    detect_all() returns both merged together.
 """
 
-import cv2
 import logging
 import threading
 import time
-from typing import Optional
+import queue
+from typing import Optional, Tuple
 
+import cv2
 import numpy as np
 
-from yolo_detector import detector
-from ml_predictor  import TrafficHistoryManager
+# ── Import your existing DualYOLODetector singleton ──────────────────────────
+# detector is the singleton defined at the bottom of yolo_detector.py
+from yolo_detector import detector as _yolo_detector
 
 log = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+YOLO_DETECT_EVERY  = 5     # run detection every Nth frame
+                            # at ~7 fps → ~1.4 detections per second
+DETECTION_HOLD_SEC = 8     # keep detected=True for 8s after last positive
+                            # prevents flickering between GREEN/RED
+AMBULANCE_CONF_MIN = 0.45  # match your CONF_THRESH in yolo_detector.py
 
-FRAME_INTERVAL_S   = 2.0    # process one frame every N seconds
-CONFIRM_FRAMES     = 3      # require N consecutive ambulance detections
-DISPLAY_ENABLED    = False  # set True to show OpenCV window (dev only)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CameraChannel — one ESP32-CAM per intersection
+# ═══════════════════════════════════════════════════════════════════════════════
 
-class CameraPipeline:
+class CameraChannel:
     """
-    Runs dual YOLO detection on a video source in a background thread.
-    Stores the latest detection result for the Flask API to read.
-
-    One instance per camera/signal junction.
+    One instance per signal intersection.
+    Accepts raw grayscale frames from ESP32-CAM.
+    Runs DualYOLODetector in background thread.
+    Builds JPEG for MJPEG /stream endpoint.
     """
 
-    def __init__(self, signal_id: str, source=0,
-                 history_manager: Optional[TrafficHistoryManager] = None):
-        self.signal_id       = signal_id
-        self.source          = source
-        self.history_manager = history_manager
+    def __init__(self, signal_id: str):
+        self.signal_id        = signal_id
+        self._frame_count     = 0
+        self.total_frames     = 0
+        self.total_detections = 0
+        self.last_vehicle_count = 0
 
-        self._thread         = None
-        self._running        = False
-        self._result         = _empty_result(signal_id)
-        self._lock           = threading.Lock()
-        self._amb_streak     = 0      # consecutive frames with ambulance
+        # Latest JPEG bytes for /stream
+        self._latest_jpeg = None
+        self._jpeg_lock   = threading.Lock()
 
-    def start(self):
-        """Start the detection thread."""
-        if not detector.is_ready():
-            log.info("[CAM] Loading YOLO models...")
-            if not detector.load_models():
-                log.error("[CAM] Failed to load models — pipeline will not start")
-                return
-        self._running = True
-        self._thread  = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        log.info("[CAM] Pipeline started | signal=%s source=%s",
-                 self.signal_id, self.source)
+        # Detection state
+        self._detected      = False
+        self._confidence    = 0.0
+        self._last_seen_ts  = 0.0
+        self._det_lock      = threading.Lock()
 
-    def stop(self):
-        """Stop the detection thread."""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-        log.info("[CAM] Pipeline stopped | signal=%s", self.signal_id)
+        # Background YOLO work queue — maxsize=1 so we always process latest frame
+        self._detect_queue = queue.Queue(maxsize=1)
 
-    def latest_result(self) -> dict:
-        """Return the most recent detection result (thread-safe)."""
-        with self._lock:
-            return dict(self._result)
+        # Start background worker thread
+        threading.Thread(
+            target=self._yolo_worker,
+            daemon=True,
+            name=f"yolo-{signal_id}"
+        ).start()
 
-    # ── Background Thread ─────────────────────────────────────────────────────
+        log.info("[CAM] Channel ready: %s", signal_id)
 
-    def _run(self):
-        """Main detection loop — runs in background thread."""
-        cap = self._open_source()
-        if cap is None:
-            log.error("[CAM] Cannot open source: %s", self.source)
-            return
+    # ── Called by POST /stream-frame in app.py ────────────────────────────────
 
-        last_frame_time = 0.0
-        frame_count     = 0
+    def ingest_frame(self, raw_bytes: bytes, width: int, height: int) -> dict:
+        """
+        Process one raw grayscale frame from ESP32-CAM.
+        - Decodes bytes → numpy array
+        - Queues for YOLO every Nth frame
+        - Builds annotated JPEG for /stream
+        Returns dict for HTTP response back to ESP32-CAM.
+        """
+        self._frame_count += 1
+        self.total_frames  += 1
 
-        while self._running:
-            ret, frame = cap.read()
-            if not ret:
-                log.warning("[CAM] Frame read failed — retrying in 1s")
-                time.sleep(1)
-                cap.release()
-                cap = self._open_source()
-                if cap is None:
-                    break
-                continue
-
-            now = time.time()
-            # Rate-limit: only process every FRAME_INTERVAL_S seconds
-            if now - last_frame_time < FRAME_INTERVAL_S:
-                time.sleep(0.05)
-                continue
-
-            last_frame_time = now
-            frame_count += 1
-
-            # ── Run dual YOLO detection ───────────────────────────────────────
-            detection = detector.detect_all(frame)
-
-            # Ambulance confirmation (require N consecutive frames)
-            if detection["ambulance_detected"]:
-                self._amb_streak += 1
-            else:
-                self._amb_streak = max(0, self._amb_streak - 1)
-
-            confirmed_ambulance = self._amb_streak >= CONFIRM_FRAMES
-
-            # ── Build result ──────────────────────────────────────────────────
-            result = {
-                "signal_id"         : self.signal_id,
-                "vehicle_count"     : detection["vehicle_count"],
-                "vehicles_by_class" : detection["vehicles_by_class"],
-                "ambulance_detected": confirmed_ambulance,
-                "ambulance_conf"    : detection["ambulance_conf"],
-                "ambulance_bbox"    : detection["ambulance_bbox"],
-                "frame_count"       : frame_count,
-                "timestamp"         : now,
+        # Validate
+        expected = width * height
+        if len(raw_bytes) != expected:
+            log.warning("[CAM] %s size mismatch: got %d expected %d",
+                        self.signal_id, len(raw_bytes), expected)
+            return {
+                "error"     : "size_mismatch",
+                "got"       : len(raw_bytes),
+                "expected"  : expected,
+                "detected"  : False,
+                "confidence": 0.0,
             }
 
-            with self._lock:
-                self._result = result
+        # Decode grayscale bytes → 2D numpy array
+        gray = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width))
 
-            # ── Feed into ML history ──────────────────────────────────────────
-            if self.history_manager:
-                self.history_manager.add(
-                    self.signal_id,
-                    detection["vehicle_count"]
-                )
+        # Queue for YOLO every Nth frame (non-blocking — drop if worker busy)
+        if self._frame_count % YOLO_DETECT_EVERY == 0:
+            # Convert gray → BGR here (DualYOLODetector expects BGR/RGB)
+            bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            try:
+                self._detect_queue.put_nowait(bgr)
+            except queue.Full:
+                pass  # worker still busy — skip, get next frame
 
-            # ── Optional display window ───────────────────────────────────────
-            if DISPLAY_ENABLED and detection["annotated_frame"] is not None:
-                _draw_hud(detection["annotated_frame"],
-                          detection["vehicle_count"],
-                          confirmed_ambulance, self.signal_id)
-                cv2.imshow(f"Camera — {self.signal_id}",
-                           detection["annotated_frame"])
-                if cv2.waitKey(1) & 0xFF in [ord("q"), 27]:
-                    break
+        # Build JPEG for /stream (every frame, lightweight)
+        self._build_stream_jpeg(gray, width, height)
 
-        cap.release()
-        if DISPLAY_ENABLED:
-            cv2.destroyAllWindows()
+        detected, conf = self.is_detected()
+        return {
+            "frame_no"    : self._frame_count,
+            "detected"    : detected,
+            "confidence"  : round(conf, 3),
+            "vehicle_count": self.last_vehicle_count,
+        }
 
-    def _open_source(self):
-        """Open video capture source with retry."""
+    # ── Called by GET /signal in app.py ──────────────────────────────────────
+
+    def is_detected(self) -> Tuple[bool, float]:
+        """
+        Returns (detected: bool, confidence: float).
+        Holds detected=True for DETECTION_HOLD_SEC after last sighting.
+        This prevents the traffic signal from flickering every frame.
+        """
+        with self._det_lock:
+            if self._detected:
+                return True, self._confidence
+            # Hold period — gradually fade confidence during hold
+            if self._last_seen_ts > 0:
+                elapsed = time.time() - self._last_seen_ts
+                if elapsed < DETECTION_HOLD_SEC:
+                    held = max(0.0, self._confidence * (1.0 - elapsed / DETECTION_HOLD_SEC))
+                    return True, round(held, 3)
+            return False, 0.0
+
+    # ── Called by GET /stream in app.py ──────────────────────────────────────
+
+    def get_latest_jpeg(self) -> Optional[bytes]:
+        """Returns latest annotated JPEG for MJPEG streaming."""
+        with self._jpeg_lock:
+            return self._latest_jpeg
+
+    # ── Background YOLO worker thread ─────────────────────────────────────────
+
+    def _yolo_worker(self):
+        """
+        Runs continuously in background.
+        Pulls BGR frames from queue → runs DualYOLODetector.detect_all()
+        → updates detection state and vehicle count.
+        Never blocks the HTTP request threads.
+        """
+        while True:
+            try:
+                bgr = self._detect_queue.get(timeout=1.0)
+
+                # ── Run detect_all() — uses both your YOLO models ─────────────
+                # detect_all() returns:
+                #   vehicle_count, vehicles_by_class, vehicle_detections,
+                #   ambulance_detected, ambulance_conf, ambulance_bbox,
+                #   annotated_frame, timestamp
+                result = _yolo_detector.detect_all(bgr)
+
+                ambulance_detected = result.get("ambulance_detected", False)
+                ambulance_conf     = result.get("ambulance_conf",     0.0)
+                vehicle_count      = result.get("vehicle_count",      0)
+                annotated_frame    = result.get("annotated_frame")
+
+                # Update detection state
+                with self._det_lock:
+                    self._detected   = ambulance_detected
+                    self._confidence = ambulance_conf
+                    if ambulance_detected:
+                        self._last_seen_ts = time.time()
+                        self.total_detections += 1
+                        log.info("[YOLO] 🚨 AMBULANCE at %s  conf=%.2f",
+                                 self.signal_id, ambulance_conf)
+
+                # Update vehicle count (used by /traffic endpoint in app.py)
+                self.last_vehicle_count = vehicle_count
+
+                # Update JPEG stream with YOLO-annotated frame
+                # annotated_frame already has bounding boxes drawn by yolo_detector.py
+                if annotated_frame is not None:
+                    self._update_jpeg_from_annotated(annotated_frame, ambulance_detected, ambulance_conf)
+
+            except queue.Empty:
+                # No frame queued — just loop
+                # Also auto-clear detection state if hold expired
+                with self._det_lock:
+                    if (self._detected and self._last_seen_ts > 0 and
+                            time.time() - self._last_seen_ts > DETECTION_HOLD_SEC):
+                        self._detected = False
+                        log.info("[CAM] %s detection hold expired → cleared", self.signal_id)
+
+            except Exception as e:
+                log.error("[YOLO] Worker error at %s: %s", self.signal_id, e)
+
+    # ── JPEG builders ─────────────────────────────────────────────────────────
+
+    def _build_stream_jpeg(self, gray: np.ndarray, w: int, h: int):
+        """
+        Fast JPEG build for every non-YOLO frame.
+        Simple grayscale → BGR conversion + basic overlay.
+        Called every frame to keep stream smooth.
+        """
+        display = cv2.resize(gray, (480, 360), interpolation=cv2.INTER_LINEAR)
+        bgr     = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
+        self._add_overlay(bgr)
+        self._encode_and_store(bgr)
+
+    def _update_jpeg_from_annotated(self, annotated: np.ndarray,
+                                     detected: bool, conf: float):
+        """
+        Use the annotated frame from DualYOLODetector (already has bboxes).
+        Scales to stream size and adds our overlay.
+        """
         try:
-            src = int(self.source)
-        except (ValueError, TypeError):
-            src = self.source
+            display = cv2.resize(annotated, (480, 360),
+                                 interpolation=cv2.INTER_LINEAR)
+            self._add_overlay(display, detected, conf)
+            self._encode_and_store(display)
+        except Exception as e:
+            log.error("[CAM] JPEG update error: %s", e)
 
-        cap = cv2.VideoCapture(src)
-        if not cap.isOpened():
-            log.warning("[CAM] Cannot open %s", src)
-            return None
-        # Reduce buffer size to get fresh frames
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap
+    def _add_overlay(self, bgr: np.ndarray,
+                     detected: bool = None, conf: float = 0.0):
+        """Add signal ID, status text, frame counter overlay."""
+        if detected is None:
+            detected, conf = self.is_detected()
+
+        # Top-left: camera ID
+        cv2.putText(bgr, f"Cam: {self.signal_id}",
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (200, 200, 200), 1)
+
+        # Top-right: vehicle count
+        cv2.putText(bgr, f"Vehicles: {self.last_vehicle_count}",
+                    (300, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (180, 255, 180), 1)
+
+        # Bottom: ambulance status
+        status_text  = f"AMBULANCE {conf:.0%}" if detected else "Monitoring..."
+        status_color = (0, 60, 255) if detected else (0, 220, 0)
+        cv2.putText(bgr, status_text,
+                    (8, 348), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65, status_color, 2)
+
+        # Frame counter
+        cv2.putText(bgr, f"#{self._frame_count}",
+                    (420, 348), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4, (100, 100, 100), 1)
+
+    def _encode_and_store(self, bgr: np.ndarray):
+        """JPEG encode and store as latest frame."""
+        ret, buf = cv2.imencode(".jpg", bgr,
+                                [cv2.IMWRITE_JPEG_QUALITY, 72])
+        if ret:
+            with self._jpeg_lock:
+                self._latest_jpeg = buf.tobytes()
 
 
-# ── Multi-Camera Manager ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MultiCameraManager — manages all channels, imported by app.py
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class MultiCameraManager:
     """
-    Manages multiple CameraPipelines — one per signal junction.
-    Provides a unified interface for the Flask app.
+    Central manager for all ESP32-CAM channels.
+    Imported and used by app.py exactly as before.
+
+    On init:
+      1. Calls detector.load_models() once — loads both YOLO models into RAM
+      2. Creates one CameraChannel per signal config
+
+    All channels share the SAME DualYOLODetector singleton from yolo_detector.py.
+    One model in memory — not one copy per camera.
     """
 
-    def __init__(self, signal_configs: list[dict],
-                 history_manager: TrafficHistoryManager):
-        """
-        signal_configs: list of {"signal_id": "S1", "source": 0}
-        """
-        self._pipelines = {}
-        self._history   = history_manager
+    def __init__(self, signal_configs: list, history_manager=None):
+        self._channels : dict[str, CameraChannel] = {}
+        self._history  = history_manager
 
+        # ── Load YOLO models once at startup ──────────────────────────────────
+        log.info("[CAM] Loading YOLO models...")
+        loaded = _yolo_detector.load_models()
+        if loaded:
+            log.info("[CAM] YOLO models ready ✓")
+        else:
+            log.warning("[CAM] YOLO models failed to load — "
+                        "detection will return empty results")
+
+        # ── Create channel per signal ─────────────────────────────────────────
         for cfg in signal_configs:
-            sig    = cfg["signal_id"]
-            source = cfg.get("source", 0)
-            self._pipelines[sig] = CameraPipeline(
-                signal_id=sig, source=source, history_manager=history_manager)
+            sig_id = cfg.get("signal_id")
+            if sig_id:
+                self._channels[sig_id] = CameraChannel(signal_id=sig_id)
+
+        log.info("[CAM] MultiCameraManager ready — channels: %s",
+                 list(self._channels.keys()))
 
     def start_all(self):
-        """Start all camera pipelines."""
-        for sig, pipe in self._pipelines.items():
-            pipe.start()
-        log.info("[CAM] %d pipelines started", len(self._pipelines))
+        """No-op — threads already started in CameraChannel.__init__.
+        Kept so app.py doesn't need to change."""
+        log.info("[CAM] All camera channels active")
 
-    def stop_all(self):
-        """Stop all camera pipelines."""
-        for pipe in self._pipelines.values():
-            pipe.stop()
-
-    def get_result(self, signal_id: str) -> dict:
-        """Get latest detection result for one signal."""
-        pipe = self._pipelines.get(signal_id)
-        return pipe.latest_result() if pipe else _empty_result(signal_id)
-
-    def get_all_results(self) -> dict:
-        """Get latest results for all signals."""
-        return {sig: pipe.latest_result()
-                for sig, pipe in self._pipelines.items()}
-
-    def is_ambulance_detected(self) -> tuple[bool, str]:
+    def ingest_frame(self, signal_id: str,
+                     raw_bytes: bytes, width: int, height: int) -> dict:
         """
-        Check if ambulance is detected at ANY camera.
-        Returns (detected, signal_id_where_detected).
+        Called by POST /stream-frame in app.py.
+        Auto-creates channel if new signal_id seen.
         """
-        for sig, pipe in self._pipelines.items():
-            r = pipe.latest_result()
-            if r.get("ambulance_detected"):
-                return True, sig
-        return False, ""
+        if signal_id not in self._channels:
+            log.info("[CAM] Auto-creating channel: %s", signal_id)
+            self._channels[signal_id] = CameraChannel(signal_id=signal_id)
+        return self._channels[signal_id].ingest_frame(raw_bytes, width, height)
 
+    def is_ambulance_detected(self) -> Tuple[bool, Optional[str]]:
+        """
+        Called by GET /signal in app.py.
+        Returns (detected: bool, signal_id: str or None).
+        Checks all channels — returns first positive hit.
+        """
+        for sig_id, ch in self._channels.items():
+            detected, conf = ch.is_detected()
+            if detected:
+                return True, sig_id
+        return False, None
 
-# ── HUD Drawing ───────────────────────────────────────────────────────────────
+    def get_latest_jpeg(self, signal_id: Optional[str] = None) -> Optional[bytes]:
+        """
+        Called by GET /stream in app.py.
+        Returns JPEG bytes for MJPEG streaming.
+        """
+        if signal_id and signal_id in self._channels:
+            return self._channels[signal_id].get_latest_jpeg()
+        # No specific ID → first available
+        for ch in self._channels.values():
+            frame = ch.get_latest_jpeg()
+            if frame:
+                return frame
+        return None
 
-def _draw_hud(frame, vehicle_count: int, amb_detected: bool, sig_id: str):
-    h, w = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 52), (7, 11, 20), -1)
-    cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
-    cv2.putText(frame,
-                f"Signal: {sig_id} | Vehicles: {vehicle_count}",
-                (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
-    if amb_detected:
-        flash = int(time.time() * 3) % 2 == 0
-        cv2.putText(frame, "AMBULANCE DETECTED",
-                    (w - 260, 32), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65, (0, 60, 255) if flash else (255, 255, 255), 2)
+    def get_vehicle_counts(self) -> dict:
+        """
+        Returns latest vehicle count per channel.
+        Used by /traffic endpoint in app.py to update vehicle counts.
+        """
+        return {
+            sig_id: ch.last_vehicle_count
+            for sig_id, ch in self._channels.items()
+        }
 
-
-def _empty_result(signal_id: str) -> dict:
-    return {
-        "signal_id"         : signal_id,
-        "vehicle_count"     : 0,
-        "vehicles_by_class" : {},
-        "ambulance_detected": False,
-        "ambulance_conf"    : 0.0,
-        "ambulance_bbox"    : [],
-        "frame_count"       : 0,
-        "timestamp"         : time.time(),
-    }
+    def get_stats(self) -> dict:
+        """Called by /status endpoint in app.py."""
+        return {
+            sig_id: {
+                "total_frames"      : ch.total_frames,
+                "total_detections"  : ch.total_detections,
+                "currently_detected": ch.is_detected()[0],
+                "confidence"        : ch.is_detected()[1],
+                "vehicle_count"     : ch.last_vehicle_count,
+            }
+            for sig_id, ch in self._channels.items()
+        }
