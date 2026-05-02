@@ -1,62 +1,80 @@
 """
 Smart Ambulance Backend v6 — Real GPS Route + Signal Control
 =============================================================
-UPDATED v7: 
-  - POST /stream-frame  → receives raw frames from ESP32-CAM
-  - GET  /stream        → MJPEG live stream for browser/dashboard
-  - GET  /stream-status → debug stats for camera pipeline
-All existing endpoints completely unchanged.
+RENDER-SAFE VERSION:
+  - YOLO model loads lazily (on first frame, not at startup)
+  - camera_pipeline imports are guarded with try/except
+  - No heavy imports at module level
+  - Gunicorn compatible
+=============================================================
 """
 
-import heapq, logging, math, threading, time, struct
+import logging
+import math
+import os
+import threading
+import time
 from datetime import datetime
+
 import numpy as np
 import requests
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
+
 import database as db
-from camera_pipeline import MultiCameraManager
-from ml_predictor import TrafficHistoryManager
 
-# Create history manager
-history = TrafficHistoryManager()
-
-# Define your cameras — one entry per ESP32-CAM / intersection
-# "source" key is kept for compatibility but not used (ESP32-CAM pushes frames)
-camera_manager = MultiCameraManager(
-    signal_configs=[
-        {"signal_id": "S1", "source": 0},
-        # Add more cameras here as you add more ESP32-CAMs:
-        # {"signal_id": "S2", "source": 1},
-    ],
-    history_manager=history
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
 )
-
-# Start camera pipeline (background YOLO worker threads)
-camera_manager.start_all()
-
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
+# ── Camera pipeline — lazy import ─────────────────────────────────────────────
+# Import is guarded so startup never crashes even if cv2/ultralytics missing.
+# MultiCameraManager loads YOLO on first frame, not at import time.
+_camera_manager = None
+_camera_lock    = threading.Lock()
+
+def get_camera_manager():
+    """Returns the camera manager, creating it once on first call."""
+    global _camera_manager
+    if _camera_manager is not None:
+        return _camera_manager
+    with _camera_lock:
+        if _camera_manager is not None:
+            return _camera_manager
+        try:
+            from camera_pipeline import MultiCameraManager
+            from ml_predictor import TrafficHistoryManager
+            history = TrafficHistoryManager()
+            _camera_manager = MultiCameraManager(
+                signal_configs=[{"signal_id": "S1", "source": 0}],
+                history_manager=history,
+            )
+            _camera_manager.start_all()
+            log.info("[CAM] MultiCameraManager initialised")
+        except Exception as e:
+            log.warning("[CAM] Camera pipeline unavailable: %s", e)
+            _camera_manager = None
+    return _camera_manager
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
-
-ESP32_TIMEOUT    = 2
-MAX_VEHICLES     = 100
-GREEN_RADIUS_M   = 300
-PASSED_RADIUS_M  = 100
-AVG_SPEED_MPS    = 10.0
-
-# Detection thresholds for ESP32-CAM grayscale frames
+ESP32_TIMEOUT               = 2
+MAX_VEHICLES                = 100
+GREEN_RADIUS_M              = 300
+PASSED_RADIUS_M             = 100
+AVG_SPEED_MPS               = 10.0
 AMBULANCE_BRIGHTNESS_THRESH = 200
 AMBULANCE_BRIGHT_PIXEL_PCT  = 0.08
 AMBULANCE_CONFIDENCE_MIN    = 0.45
 
 # ── Signal Nodes ──────────────────────────────────────────────────────────────
-
 SIGNALS = {
     "S1": {"vehicle_count": 12, "is_green": False, "is_stopped": False,
            "esp32_ip": "192.168.137.101",
@@ -93,29 +111,32 @@ SIGNALS = {
 _lock = threading.Lock()
 
 # ── Ambulance State ───────────────────────────────────────────────────────────
-
 ambulance = {
-    "id"             : None,
-    "lat"            : None,
-    "lon"            : None,
-    "speed_mps"      : AVG_SPEED_MPS,
-    "status"         : "inactive",
-    "last_gps_time"  : None,
-    "dest_lat"       : None,
-    "dest_lon"       : None,
-    "dest_name"      : "",
-    "distance_text"  : "",
-    "duration_text"  : "",
-    "trip_id"        : None,
-    "passed_signals" : set(),
-    "active_signals" : [],
+    "id"            : None,
+    "lat"           : None,
+    "lon"           : None,
+    "speed_mps"     : AVG_SPEED_MPS,
+    "status"        : "inactive",
+    "last_gps_time" : None,
+    "dest_lat"      : None,
+    "dest_lon"      : None,
+    "dest_name"     : "",
+    "distance_text" : "",
+    "duration_text" : "",
+    "trip_id"       : None,
+    "passed_signals": set(),
+    "active_signals": [],
 }
 
 yolo_state = {s: {"detected": False, "confidence": 0.0, "last_seen": None}
               for s in SIGNALS}
 
-# ── Utility ───────────────────────────────────────────────────────────────────
+# ── Stream frame storage (for GET /stream) ────────────────────────────────────
+_latest_jpeg      = None
+_stream_lock      = threading.Lock()
+_stream_frame_no  = 0
 
+# ── Utility ───────────────────────────────────────────────────────────────────
 def _haversine(lat1, lon1, lat2, lon2) -> float:
     R  = 6_371_000
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -124,8 +145,8 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     a  = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def _now()  -> float: return time.time()
-def _ts()   -> str:   return datetime.utcnow().isoformat() + "Z"
+def _now() -> float:  return time.time()
+def _ts()  -> str:    return datetime.utcnow().isoformat() + "Z"
 
 def _congestion(c) -> str:
     if c < 20: return "LOW"
@@ -133,25 +154,24 @@ def _congestion(c) -> str:
     if c < 75: return "HIGH"
     return "CRITICAL"
 
-# ── ESP32-CAM Frame Detection ─────────────────────────────────────────────────
-
+# ── Brightness-spike ambulance detection (no YOLO needed) ────────────────────
 def _detect_ambulance_in_frame(frame_bytes: bytes, width: int, height: int) -> dict:
     """
-    Brightness-spike fallback detection.
-    Used by POST /detect (the raw-bytes endpoint).
-    YOLO detection happens inside camera_pipeline.py via POST /stream-frame.
+    Fast brightness-spike detection — runs on every frame.
+    YOLO runs additionally in background via camera_pipeline (every 5th frame).
     """
     try:
-        frame = np.frombuffer(frame_bytes, dtype=np.uint8)
-        if len(frame) != width * height:
+        frame    = np.frombuffer(frame_bytes, dtype=np.uint8)
+        expected = width * height
+        if len(frame) != expected:
             return {"detected": False, "confidence": 0.0,
                     "method": "error", "error": "size_mismatch"}
 
-        frame         = frame.reshape((height, width))
-        bright_pixels = int(np.sum(frame > AMBULANCE_BRIGHTNESS_THRESH))
-        total_pixels  = width * height
-        bright_pct    = bright_pixels / total_pixels
-        avg_brightness= float(np.mean(frame))
+        frame          = frame.reshape((height, width))
+        bright_pixels  = int(np.sum(frame > AMBULANCE_BRIGHTNESS_THRESH))
+        total_pixels   = width * height
+        bright_pct     = bright_pixels / total_pixels
+        avg_brightness = float(np.mean(frame))
 
         if bright_pct >= AMBULANCE_BRIGHT_PIXEL_PCT:
             confidence = min(0.95, 0.45 + (bright_pct - 0.08) * 6.0)
@@ -160,23 +180,22 @@ def _detect_ambulance_in_frame(frame_bytes: bytes, width: int, height: int) -> d
             confidence = bright_pct * 5.6
             detected   = False
 
-        log.info("[DETECT] %dx%d | bright=%.1f%% avg=%.0f | %s conf=%.2f",
-                 width, height, bright_pct*100, avg_brightness,
+        log.info("[CAM] %dx%d bright=%.1f%% avg=%.0f %s conf=%.2f",
+                 width, height, bright_pct * 100, avg_brightness,
                  "DETECTED" if detected else "clear", confidence)
 
         return {
-            "detected"        : detected,
-            "confidence"      : round(confidence, 3),
-            "method"          : "brightness_spike",
-            "bright_pct"      : round(bright_pct * 100, 2),
-            "avg_brightness"  : round(avg_brightness, 1),
+            "detected"      : detected,
+            "confidence"    : round(confidence, 3),
+            "method"        : "brightness_spike",
+            "bright_pct"    : round(bright_pct * 100, 2),
+            "avg_brightness": round(avg_brightness, 1),
         }
     except Exception as e:
-        log.error("[DETECT] Error: %s", e)
-        return {"detected": False, "confidence": 0.0, "method": "error", "error": str(e)}
+        log.error("[CAM] Detection error: %s", e)
+        return {"detected": False, "confidence": 0.0, "method": "error"}
 
 # ── ESP32 Signal Control ──────────────────────────────────────────────────────
-
 def _send_esp32(sig_id: str, cmd: str) -> dict:
     if sig_id not in SIGNALS:
         return {"signal": sig_id, "success": False}
@@ -213,7 +232,6 @@ def _send_parallel(signal_ids: list, cmd: str) -> list:
     return results
 
 # ── Route Logic ───────────────────────────────────────────────────────────────
-
 def _signals_near_ambulance(amb_lat, amb_lon, radius_m=GREEN_RADIUS_M):
     nearby = []
     for sig_id, sig in SIGNALS.items():
@@ -236,8 +254,7 @@ def _signals_between(amb_lat, amb_lon, dest_lat, dest_lon):
     return [s for s, _ in candidates]
 
 
-def _control_corridor(amb_lat, amb_lon, dest_lat, dest_lon,
-                       speed, trip_id, amb_id):
+def _control_corridor(amb_lat, amb_lon, dest_lat, dest_lon, speed, trip_id, amb_id):
     route_sigs = _signals_between(amb_lat, amb_lon, dest_lat, dest_lon)
     cross_sigs = [s for s in SIGNALS if s not in set(route_sigs)]
     green_now, scheduled = [], []
@@ -247,17 +264,13 @@ def _control_corridor(amb_lat, amb_lon, dest_lat, dest_lon,
             continue
         dist = _haversine(amb_lat, amb_lon, SIGNALS[sig_id]["lat"], SIGNALS[sig_id]["lon"])
         eta  = dist / max(speed, 1.0)
-        if eta < 30:
-            green_now.append(sig_id)
-        elif eta < 120:
-            scheduled.append((sig_id, eta))
+        if eta < 30:    green_now.append(sig_id)
+        elif eta < 120: scheduled.append((sig_id, eta))
 
-    if cross_sigs:
-        _send_parallel(cross_sigs, "STOP")
+    if cross_sigs: _send_parallel(cross_sigs, "STOP")
     if green_now:
         _send_parallel(green_now, "GREEN")
-        with _lock:
-            ambulance["active_signals"] = green_now
+        with _lock: ambulance["active_signals"] = green_now
 
     for sig_id, eta in scheduled:
         delay = max(0, eta - 25)
@@ -269,8 +282,7 @@ def _control_corridor(amb_lat, amb_lon, dest_lat, dest_lon,
 
     return {"route_signals": route_sigs, "green_now": green_now, "cross_stopped": cross_sigs}
 
-# ── Traffic Simulation ────────────────────────────────────────────────────────
-
+# ── Background traffic simulation ─────────────────────────────────────────────
 def _simulate():
     import random
     while True:
@@ -283,8 +295,7 @@ def _simulate():
 
 threading.Thread(target=_simulate, daemon=True).start()
 
-# ── Traffic Snapshot ──────────────────────────────────────────────────────────
-
+# ── Traffic snapshot ──────────────────────────────────────────────────────────
 def _traffic_snapshot() -> dict:
     with _lock:
         return {
@@ -302,27 +313,35 @@ def _traffic_snapshot() -> dict:
             for sid, s in SIGNALS.items()
         }
 
+# ── JPEG placeholder for /stream when no frame yet ───────────────────────────
+def _placeholder_jpeg() -> bytes:
+    try:
+        import cv2
+        img = np.zeros((360, 480, 3), dtype=np.uint8)
+        cv2.putText(img, "Waiting for ESP32-CAM...",
+                    (60, 180), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (100, 100, 100), 2)
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        return buf.tobytes()
+    except Exception:
+        return b""
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ── NEW ROUTE 1: POST /stream-frame ──────────────────────────────────────────
-# Receives raw grayscale frame from ESP32-CAM.
-# Runs YOLO (via camera_pipeline) + builds JPEG for /stream.
+#  API ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── POST /stream-frame — receives raw frame from ESP32-CAM ───────────────────
 @app.route("/stream-frame", methods=["POST"])
 def stream_frame():
     """
-    Called by ESP32-CAM every ~150ms (stream mode) or every 3s (detect mode).
-
-    Headers from ESP32-CAM:
-        X-Signal-ID    : S1
-        X-Ambulance-ID : CAM_S1
-        X-Width        : 160
-        X-Height       : 120
-        X-Frame-No     : <counter>
-
-    Body: raw uint8 grayscale bytes (160 × 120 = 19200 bytes)
+    Receives raw grayscale frame from ESP32-CAM.
+    Runs brightness detection immediately.
+    Also feeds into camera_pipeline for YOLO (every 5th frame).
+    Stores JPEG for GET /stream.
     """
+    global _latest_jpeg, _stream_frame_no
+
     sig_id   = request.headers.get("X-Signal-ID",    "S1")
     cam_id   = request.headers.get("X-Ambulance-ID", "CAM_UNKNOWN")
     width    = int(request.headers.get("X-Width",    160))
@@ -330,31 +349,71 @@ def stream_frame():
     frame_no = int(request.headers.get("X-Frame-No", 0))
 
     if sig_id not in SIGNALS:
-        return jsonify({"error": f"Unknown signal: {sig_id}. Valid: {list(SIGNALS.keys())}"}), 400
+        return jsonify({"error": f"Unknown signal: {sig_id}"}), 400
 
     raw = request.data
     if not raw:
         return jsonify({"error": "No frame data"}), 400
 
-    # ── Hand off to camera_pipeline for YOLO + JPEG build ────────────────────
-    result   = camera_manager.ingest_frame(sig_id, raw, width, height)
-    detected = result.get("detected", False)
-    conf     = result.get("confidence", 0.0)
+    _stream_frame_no += 1
 
-    # ── Update yolo_state dict (used by /status) ──────────────────────────────
+    # ── 1. Feed into camera_pipeline (YOLO runs in background) ───────────────
+    cam = get_camera_manager()
+    yolo_detected, yolo_conf = False, 0.0
+    if cam is not None:
+        try:
+            result        = cam.ingest_frame(sig_id, raw, width, height)
+            yolo_detected = result.get("detected", False)
+            yolo_conf     = result.get("confidence", 0.0)
+            # Get latest JPEG from pipeline (has YOLO bboxes drawn on it)
+            jpeg = cam.get_latest_jpeg(sig_id)
+            if jpeg:
+                with _stream_lock:
+                    _latest_jpeg = jpeg
+        except Exception as e:
+            log.warning("[STREAM] Camera pipeline error: %s", e)
+
+    # ── 2. Also run brightness detection as fast fallback ────────────────────
+    bright_result = _detect_ambulance_in_frame(raw, width, height)
+    bright_detected = bright_result["detected"]
+    bright_conf     = bright_result["confidence"]
+
+    # ── 3. Combine: YOLO wins if available, else use brightness ──────────────
+    detected   = yolo_detected or bright_detected
+    confidence = max(yolo_conf, bright_conf)
+
+    # ── 4. If no JPEG from pipeline, build a simple one ──────────────────────
+    with _stream_lock:
+        if _latest_jpeg is None:
+            try:
+                import cv2
+                gray = np.frombuffer(raw, dtype=np.uint8).reshape((height, width))
+                bgr  = cv2.cvtColor(
+                    cv2.resize(gray, (480, 360)), cv2.COLOR_GRAY2BGR)
+                status = "AMBULANCE!" if detected else "Monitoring"
+                color  = (0, 0, 255) if detected else (0, 200, 0)
+                cv2.putText(bgr, f"Cam:{sig_id}  {status}",
+                            (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65, color, 2)
+                _, buf = cv2.imencode(".jpg", bgr,
+                                      [cv2.IMWRITE_JPEG_QUALITY, 72])
+                _latest_jpeg = buf.tobytes()
+            except Exception:
+                pass
+
+    # ── 5. Update YOLO state ──────────────────────────────────────────────────
     with _lock:
         yolo_state[sig_id].update({
             "detected"  : detected,
-            "confidence": conf,
+            "confidence": confidence,
             "last_seen" : _now() if detected else yolo_state[sig_id]["last_seen"],
         })
 
-    # ── If ambulance detected → trigger corridor control ──────────────────────
+    # ── 6. Signal control ─────────────────────────────────────────────────────
     action = "NONE"
-    if detected and conf >= AMBULANCE_CONFIDENCE_MIN:
+    if detected and confidence >= AMBULANCE_CONFIDENCE_MIN:
         _send_esp32(sig_id, "GREEN")
         action = "GREEN"
-
         dest_lat = ambulance.get("dest_lat") or 0
         dest_lon = ambulance.get("dest_lon") or 0
         amb_lat  = ambulance.get("lat") or SIGNALS[sig_id]["lat"]
@@ -366,11 +425,10 @@ def stream_frame():
             threading.Thread(target=_send_parallel,
                              args=(cross, "STOP"), daemon=True).start()
             action = "GREEN+STOP_CROSSING"
-
         lat = ambulance.get("lat") or SIGNALS[sig_id]["lat"]
         lon = ambulance.get("lon") or SIGNALS[sig_id]["lon"]
-        db.log_detection(cam_id, conf, [], "yolo_stream", lat, lon)
-        log.info("[STREAM] 🚨 AMBULANCE at %s conf=%.2f → %s", sig_id, conf, action)
+        db.log_detection(cam_id, confidence, [], "stream_frame", lat, lon)
+        log.info("[STREAM] 🚨 AMBULANCE at %s conf=%.2f → %s", sig_id, confidence, action)
 
     elif not detected and SIGNALS[sig_id]["is_green"]:
         _send_esp32(sig_id, "RESET")
@@ -381,101 +439,23 @@ def stream_frame():
     return jsonify({
         "received"    : True,
         "frame_no"    : frame_no,
-        "signal"      : "GREEN" if (detected and conf >= AMBULANCE_CONFIDENCE_MIN) else "RED",
+        "signal"      : "GREEN" if (detected and confidence >= AMBULANCE_CONFIDENCE_MIN) else "RED",
         "detected"    : detected,
-        "confidence"  : round(conf, 3),
+        "confidence"  : round(confidence, 3),
         "action_taken": action,
         "signal_id"   : sig_id,
         "timestamp"   : _ts(),
     }), 200
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── NEW ROUTE 2: GET /stream ─────────────────────────────────────────────────
-# MJPEG live stream. Open in browser or <img> tag in dashboard.
-# URL: http://YOUR_SERVER:5000/stream
-#      http://YOUR_SERVER:5000/stream?id=S1  (specific camera)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/stream")
-def mjpeg_stream():
-    """
-    Live MJPEG stream from ESP32-CAM.
-    Open in browser: http://localhost:5000/stream
-    In React dashboard: <img src="http://localhost:5000/stream" />
-    In VLC: Media → Open Network Stream → paste URL
-    """
-    sig_id = request.args.get("id", None)  # optional ?id=S1
-
-    def _generate():
-        while True:
-            frame = camera_manager.get_latest_jpeg(sig_id)
-
-            if frame is None:
-                # No frame yet — send a "waiting" placeholder JPEG
-                placeholder = _make_placeholder_jpeg(
-                    sig_id or "Waiting for camera..."
-                )
-                frame = placeholder
-
-            # MJPEG multipart frame
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + frame +
-                b"\r\n"
-            )
-            time.sleep(0.04)  # ~25fps max server-side (actual fps = ESP32-CAM send rate)
-
-    return Response(
-        _generate(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
-
-
-def _make_placeholder_jpeg(text: str = "No camera feed") -> bytes:
-    """Generate a simple black JPEG with text when no frame is available."""
-    import cv2
-    import numpy as np
-    img = np.zeros((360, 480, 3), dtype=np.uint8)
-    cv2.putText(img, text, (40, 180),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
-    cv2.putText(img, "Waiting for ESP32-CAM...", (60, 220),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1)
-    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-    return buf.tobytes()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── NEW ROUTE 3: GET /stream-status ─────────────────────────────────────────
-# Debug stats — useful during viva/testing
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/stream-status")
-def stream_status():
-    """Camera pipeline stats for debugging."""
-    return jsonify({
-        "camera_stats" : camera_manager.get_stats(),
-        "yolo_state"   : yolo_state,
-        "timestamp"    : _ts(),
-    }), 200
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ALL EXISTING ENDPOINTS BELOW — COMPLETELY UNCHANGED
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ── POST /detect — original endpoint (kept for backward compat) ───────────────
 @app.route("/detect", methods=["POST"])
 def detect_from_cam():
-    """
-    Original /detect endpoint — raw frame, brightness-spike detection.
-    Kept for backward compatibility with older ESP32-CAM sketch.
-    New sketch should use POST /stream-frame instead.
-    """
+    """Original /detect endpoint — brightness detection only, no stream."""
     sig_id   = request.headers.get("X-Signal-ID",    "S1")
     cam_id   = request.headers.get("X-Ambulance-ID", "CAM_UNKNOWN")
-    width    = int(request.headers.get("X-Width",  "160"))
-    height   = int(request.headers.get("X-Height", "120"))
+    width    = int(request.headers.get("X-Width",  160))
+    height   = int(request.headers.get("X-Height", 120))
 
     if sig_id not in SIGNALS:
         return jsonify({"error": f"Unknown signal: {sig_id}"}), 400
@@ -507,8 +487,8 @@ def detect_from_cam():
         dest_lon = ambulance.get("dest_lon", 0) or 0
         amb_lat  = ambulance.get("lat") or SIGNALS[sig_id]["lat"]
         amb_lon  = ambulance.get("lon") or SIGNALS[sig_id]["lon"]
-        route_sigs = set(_signals_between(amb_lat, amb_lon, dest_lat, dest_lon)) \
-                     if dest_lat else {sig_id}
+        route_sigs = (set(_signals_between(amb_lat, amb_lon, dest_lat, dest_lon))
+                      if dest_lat else {sig_id})
         cross = [s for s in SIGNALS if s != sig_id and s not in route_sigs]
         if cross:
             threading.Thread(target=_send_parallel,
@@ -535,31 +515,76 @@ def detect_from_cam():
     }), 200
 
 
+# ── GET /stream — MJPEG stream ────────────────────────────────────────────────
+@app.route("/stream")
+def mjpeg_stream():
+    """
+    MJPEG live stream. Open in browser:
+        http://YOUR_SERVER:5000/stream
+    Or in React: <img src="http://YOUR_SERVER:5000/stream" />
+    """
+    def _generate():
+        while True:
+            with _stream_lock:
+                frame = _latest_jpeg
+            if frame is None:
+                frame = _placeholder_jpeg()
+            if frame:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + frame + b"\r\n")
+            time.sleep(0.04)
+
+    return Response(_generate(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+# ── GET /stream-status ────────────────────────────────────────────────────────
+@app.route("/stream-status")
+def stream_status():
+    with _stream_lock:
+        has_frame  = _latest_jpeg is not None
+        frame_size = len(_latest_jpeg) if _latest_jpeg else 0
+    cam = get_camera_manager()
+    return jsonify({
+        "streaming"      : has_frame,
+        "frames_received": _stream_frame_no,
+        "frame_kb"       : round(frame_size / 1024, 1),
+        "yolo_available" : cam is not None,
+        "cam_stats"      : cam.get_stats() if cam else {},
+        "timestamp"      : _ts(),
+    })
+
+
+# ── GET /signal ───────────────────────────────────────────────────────────────
 @app.route("/signal", methods=["GET"])
 def get_signal_state():
     sig_id = request.args.get("id", None)
 
-    # ── 1. YOLO/Camera detection (highest priority) ───────────────────────────
-    try:
-        detected, cam_sig = camera_manager.is_ambulance_detected()
-    except Exception:
-        detected, cam_sig = False, None
+    # 1. Camera/YOLO detection (highest priority)
+    cam = get_camera_manager()
+    detected, cam_sig = False, None
+    if cam is not None:
+        try:
+            detected, cam_sig = cam.is_ambulance_detected()
+        except Exception:
+            pass
 
     if detected:
         if sig_id:
             return ("GREEN" if sig_id == cam_sig else "RED"), 200, {"Content-Type": "text/plain"}
         return "GREEN", 200, {"Content-Type": "text/plain"}
 
-    # ── 2. GPS corridor logic ─────────────────────────────────────────────────
+    # 2. Signal state from /detect or GPS corridor
     if sig_id and sig_id in SIGNALS:
-        is_green = SIGNALS[sig_id]["is_green"]
-        return ("GREEN" if is_green else "RED"), 200, {"Content-Type": "text/plain"}
+        return ("GREEN" if SIGNALS[sig_id]["is_green"] else "RED"), 200, {"Content-Type": "text/plain"}
 
-    # ── 3. Global fallback ────────────────────────────────────────────────────
+    # 3. Global fallback
     any_green  = any(s["is_green"] for s in SIGNALS.values())
     amb_active = ambulance.get("status") == "active"
     return ("GREEN" if (any_green or amb_active) else "RED"), 200, {"Content-Type": "text/plain"}
 
+
+# ── All remaining endpoints — UNCHANGED ──────────────────────────────────────
 
 @app.route("/set-route", methods=["POST"])
 def set_route():
@@ -648,12 +673,12 @@ def update_location():
 
 @app.route("/ambulance", methods=["POST"])
 def receive_ambulance():
-    data   = request.get_json(silent=True) or {}
-    amb_id = data.get("ambulance_id", "AMB001")
-    lat    = float(data.get("lat", 0))
-    lon    = float(data.get("lon", 0))
-    status = data.get("status", "inactive").lower()
-    speed  = float(data.get("speed", 0)) / 3.6
+    data     = request.get_json(silent=True) or {}
+    amb_id   = data.get("ambulance_id", "AMB001")
+    lat      = float(data.get("lat", 0))
+    lon      = float(data.get("lon", 0))
+    status   = data.get("status", "inactive").lower()
+    speed    = float(data.get("speed", 0)) / 3.6
     amb_info = db.get_ambulance(amb_id)
 
     with _lock:
@@ -676,11 +701,13 @@ def receive_ambulance():
             db.end_trip(trip_id, amb_id, lat, lon,
                         list(ambulance.get("passed_signals", set())))
         all_sigs = list(SIGNALS.keys())
-        threading.Thread(target=_send_parallel, args=(all_sigs, "RESET"), daemon=True).start()
+        threading.Thread(target=_send_parallel,
+                         args=(all_sigs, "RESET"), daemon=True).start()
         with _lock:
-            ambulance.update({"status": "inactive", "trip_id": None,
-                               "passed_signals": set(), "active_signals": [],
-                               "dest_lat": None, "dest_lon": None})
+            ambulance.update({
+                "status": "inactive", "trip_id": None,
+                "passed_signals": set(), "active_signals": [],
+                "dest_lat": None, "dest_lon": None})
             for s in SIGNALS.values():
                 s.update({"is_green": False, "is_stopped": False, "current_phase": "RED"})
         payload["signals_reset"] = all_sigs
@@ -702,8 +729,9 @@ def yolo_detection():
         return jsonify({"error": f"Unknown signal: {sig_id}"}), 400
 
     with _lock:
-        yolo_state[sig_id].update({"detected": detected, "confidence": confidence,
-                                    "last_seen": _now() if detected else yolo_state[sig_id]["last_seen"]})
+        yolo_state[sig_id].update({
+            "detected": detected, "confidence": confidence,
+            "last_seen": _now() if detected else yolo_state[sig_id]["last_seen"]})
         if vc > 0:
             SIGNALS[sig_id]["vehicle_count"] = vc
 
@@ -715,11 +743,12 @@ def yolo_detection():
         dest_lon = ambulance.get("dest_lon", 0) or 0
         amb_lat  = ambulance.get("lat") or SIGNALS[sig_id]["lat"]
         amb_lon  = ambulance.get("lon") or SIGNALS[sig_id]["lon"]
-        route_sigs = set(_signals_between(amb_lat, amb_lon, dest_lat, dest_lon)) \
-                     if dest_lat else {sig_id}
+        route_sigs = (set(_signals_between(amb_lat, amb_lon, dest_lat, dest_lon))
+                      if dest_lat else {sig_id})
         cross = [s for s in SIGNALS if s != sig_id and s not in route_sigs]
         if cross:
-            threading.Thread(target=_send_parallel, args=(cross, "STOP"), daemon=True).start()
+            threading.Thread(target=_send_parallel,
+                args=(cross, "STOP"), daemon=True).start()
             action = "GREEN+STOP_CROSSING"
     elif not detected and SIGNALS[sig_id]["is_green"]:
         _send_esp32(sig_id, "RESET")
@@ -731,20 +760,22 @@ def yolo_detection():
     lon = ambulance.get("lon") or SIGNALS[sig_id]["lon"]
     db.log_detection(amb_id, confidence, data.get("bbox", []), "yolo_camera", lat, lon)
 
-    return jsonify({"signal_id": sig_id, "detected": detected, "confidence": confidence,
-                    "action_taken": action, "signal_state": SIGNALS[sig_id]["current_phase"],
-                    "timestamp": _ts()}), 200
+    return jsonify({
+        "signal_id": sig_id, "detected": detected, "confidence": confidence,
+        "action_taken": action, "signal_state": SIGNALS[sig_id]["current_phase"],
+        "timestamp": _ts()}), 200
 
 
 @app.route("/signal-control", methods=["POST"])
 def signal_control():
     data    = request.get_json(silent=True) or {}
-    targets = [data["signal_id"]] if "signal_id" in data else data.get("signal_ids", [])
+    targets = ([data["signal_id"]] if "signal_id" in data
+               else data.get("signal_ids", []))
     cmd     = data.get("cmd", "GREEN").upper()
     if cmd not in {"GREEN", "RED", "STOP", "RESET"}:
         return jsonify({"error": "Invalid cmd"}), 400
-    results = _send_parallel(targets, cmd)
-    return jsonify({"cmd": cmd, "results": results, "timestamp": _ts()}), 200
+    return jsonify({"cmd": cmd, "results": _send_parallel(targets, cmd),
+                    "timestamp": _ts()}), 200
 
 
 @app.route("/traffic", methods=["GET"])
@@ -752,7 +783,8 @@ def get_traffic():
     snap = _traffic_snapshot()
     avg  = sum(snap[s]["vehicle_count"] for s in snap) / len(snap)
     return jsonify({"signals": snap, "average_count": round(avg, 1),
-                    "overall_status": _congestion(int(avg)), "timestamp": _ts()}), 200
+                    "overall_status": _congestion(int(avg)),
+                    "timestamp": _ts()}), 200
 
 
 @app.route("/traffic", methods=["POST"])
@@ -760,7 +792,7 @@ def update_traffic():
     data  = request.get_json(silent=True) or {}
     sid   = data.get("signal_id")
     count = data.get("vehicle_count")
-    if sid not in SIGNALS or count is None or count < 0:
+    if sid not in SIGNALS or count is None or int(count) < 0:
         return jsonify({"error": "Invalid input"}), 400
     with _lock:
         SIGNALS[sid]["vehicle_count"] = min(int(count), MAX_VEHICLES)
@@ -773,15 +805,17 @@ def get_status():
     with _lock:
         state = {k: v for k, v in ambulance.items() if k != "passed_signals"}
         state["passed_signals"] = list(ambulance.get("passed_signals", set()))
+    cam = get_camera_manager()
     return jsonify({
-        "system"          : "Smart Ambulance v7 — GPS + ESP32-CAM Stream + YOLO",
-        "ambulance"       : state,
-        "yolo_state"      : yolo_state,
-        "camera_pipeline" : camera_manager.get_stats(),
-        "active_greens"   : sum(1 for s in SIGNALS.values() if s["is_green"]),
-        "stopped_signals" : sum(1 for s in SIGNALS.values() if s["is_stopped"]),
-        "stats"           : db.get_stats(),
-        "timestamp"       : _ts(),
+        "system"         : "Smart Ambulance v7 — GPS + ESP32-CAM + YOLO (Render-safe)",
+        "ambulance"      : state,
+        "yolo_state"     : yolo_state,
+        "camera_pipeline": cam.get_stats() if cam else "unavailable",
+        "stream_frames"  : _stream_frame_no,
+        "active_greens"  : sum(1 for s in SIGNALS.values() if s["is_green"]),
+        "stopped_signals": sum(1 for s in SIGNALS.values() if s["is_stopped"]),
+        "stats"          : db.get_stats(),
+        "timestamp"      : _ts(),
     }), 200
 
 
@@ -818,39 +852,38 @@ def get_ambulance(amb_id):
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "name"     : "Smart Ambulance v7 — GPS + ESP32-CAM + YOLO Stream",
+        "name"   : "Smart Ambulance v7 — GPS + ESP32-CAM + YOLO (Render-safe)",
+        "stream" : "/stream",
         "endpoints": {
-            "POST /stream-frame"    : "ESP32-CAM pushes raw grayscale frame → YOLO + stream",
-            "GET  /stream"          : "MJPEG live stream for browser (add ?id=S1 for specific cam)",
-            "GET  /stream-status"   : "Camera pipeline debug stats",
-            "POST /detect"          : "ESP32-CAM raw frame → brightness detection (legacy)",
-            "GET  /signal"          : "Traffic ESP32 polls → GREEN or RED",
-            "POST /set-route"       : "Flutter app starts ambulance mode",
-            "POST /update-location" : "Flutter live GPS every 3s",
-            "POST /ambulance"       : "Legacy GPS ping / deactivate",
-            "POST /detection"       : "YOLO JSON result (legacy detect.py)",
-            "GET  /traffic"         : "Traffic status all signals",
-            "GET  /status"          : "Full system status + camera stats",
+            "POST /stream-frame"   : "ESP32-CAM raw frame → YOLO + stream + signal control",
+            "POST /detect"         : "ESP32-CAM raw frame → brightness detection (legacy)",
+            "GET  /stream"         : "MJPEG live camera stream for browser",
+            "GET  /stream-status"  : "Camera pipeline debug stats",
+            "GET  /signal"         : "Traffic ESP32 polls → GREEN or RED",
+            "POST /set-route"      : "Flutter app starts ambulance mode",
+            "POST /update-location": "Flutter live GPS every 3s",
+            "POST /ambulance"      : "Legacy GPS ping / deactivate",
+            "POST /detection"      : "YOLO JSON result (legacy)",
+            "GET  /traffic"        : "All signal traffic status",
+            "GET  /status"         : "Full system status",
         },
-        "stream_url" : "/stream",
-        "signals"    : list(SIGNALS.keys()),
-        "timestamp"  : _ts(),
+        "signals"  : list(SIGNALS.keys()),
+        "timestamp": _ts(),
     }), 200
 
 
 @app.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "Not found"}), 404
+def not_found(e):   return jsonify({"error": "Not found"}), 404
 
 @app.errorhandler(500)
-def server_error(e):
-    return jsonify({"error": "Internal server error"}), 500
+def server_error(e): return jsonify({"error": "Internal error"}), 500
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
     log.info("=" * 60)
-    log.info("  Smart Ambulance v7")
-    log.info("  POST /stream-frame → YOLO detection + MJPEG stream")
-    log.info("  GET  /stream       → open in browser for live view")
+    log.info("  Smart Ambulance v7 — Render-safe startup")
+    log.info("  YOLO loads lazily on first frame — no startup crash")
+    log.info("  PORT: %d", port)
     log.info("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
