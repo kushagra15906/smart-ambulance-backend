@@ -555,6 +555,17 @@ def stream_status():
     })
 
 
+@app.route("/stream-snapshot")
+def stream_snapshot():
+    with _stream_lock:
+        frame = _latest_jpeg
+    if frame is None:
+        frame = _placeholder_jpeg()
+    if not frame:
+        return "", 204
+    return Response(frame, mimetype="image/jpeg",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
 # ── GET /signal ───────────────────────────────────────────────────────────────
 @app.route("/signal", methods=["GET"])
 def get_signal_state():
