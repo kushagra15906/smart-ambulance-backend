@@ -538,6 +538,17 @@ def mjpeg_stream():
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.route("/stream-snapshot")
+def stream_snapshot():
+    """Single JPEG frame — works on Render (no persistent connection needed)."""
+    with _stream_lock:
+        frame = _latest_jpeg
+    if frame is None:
+        return jsonify({"error": "No frame yet — ESP32-CAM not connected"}), 503
+    from flask import Response
+    return Response(frame, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-cache, no-store"})
+
 # ── GET /stream-status ────────────────────────────────────────────────────────
 @app.route("/stream-status")
 def stream_status():
