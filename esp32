@@ -1,0 +1,593 @@
+/*
+ * ============================================================
+ *  Smart Ambulance Traffic Control System — v7
+ *  ESP32 + SSD1306 OLED + HC-SR04 + 2× Traffic Signals + Buzzer
+ *
+ *  UPDATED v7:
+ *  - Works with PHONE HOTSPOT (no router needed)
+ *  - Polls GET /signal?id=S1 instead of /signal
+ *  - Shows "SERVER OK" / "SERVER ERR" on OLED instead of OFFLINE
+ *  - Auto-reconnects WiFi every 30 seconds if dropped
+ *  - HTTPS disabled (using HTTP to hotspot IP - faster + simpler)
+ *
+ *  BUTTON (press-based):
+ *  - 1 press  → Flip signal color (MANUAL mode only)
+ *  - 2 presses → Toggle MANUAL ↔ AUTO mode
+ * ============================================================
+ */
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// ─────────────────────────────────────────────
+//  ★ EDIT THESE — Your phone hotspot details
+// ─────────────────────────────────────────────
+
+// Your PHONE hotspot name and password
+const char* WIFI_SSID     = "ESP_TEST";     // ← phone hotspot name
+const char* WIFI_PASSWORD = "12345678";  // ← phone hotspot password
+
+// Your PC's IP when connected to phone hotspot
+// Run: ipconfig | findstr "192.168.43" OR "192.168.137" on PC
+// Usually 192.168.43.X (Android hotspot) or 192.168.137.X (Windows hotspot)
+const char* SERVER_HOST = "10.240.76.195";  // your laptop IP
+const int SERVER_PORT = 5000; 
+
+// Which signal this ESP32 controls
+// Must match a key in SIGNALS dict in app.py
+const char* SIGNAL_ID     = "S1";
+
+// ─────────────────────────────────────────────
+//  PIN DEFINITIONS
+// ─────────────────────────────────────────────
+#define SIG1_RED    23
+#define SIG1_YLW    19
+#define SIG1_GRN    18
+
+#define SIG2_RED    5
+#define SIG2_YLW    17
+#define SIG2_GRN    16
+
+#define TRIG_PIN    13
+#define ECHO_PIN    12
+
+#define OLED_WIDTH  128
+#define OLED_HEIGHT 64
+#define OLED_ADDR   0x3C
+
+#define BTN_PIN     15
+#define BUZZER_PIN  2
+
+// ─────────────────────────────────────────────
+//  TIMING
+// ─────────────────────────────────────────────
+const unsigned long GREEN_PHASE_MS    = 5000;
+const unsigned long YELLOW_PHASE_MS   = 2000;
+const unsigned long SERVER_POLL_MS    = 2000;   // poll every 2 seconds
+const unsigned long DENSITY_SAMPLE_MS = 1000;
+const unsigned long AMBULANCE_HOLD_MS = 15000;
+const unsigned long WIFI_RETRY_MS     = 30000;  // retry WiFi every 30s
+
+const unsigned long DEBOUNCE_MS      = 50;
+const unsigned long DOUBLE_PRESS_MS  = 500;     // max gap between presses for double-click
+
+// ─────────────────────────────────────────────
+//  ENUMERATIONS
+// ─────────────────────────────────────────────
+enum SystemMode  { MODE_AUTO, MODE_MANUAL, MODE_AMBULANCE };
+enum TrafficPhase{ PHASE_SIG1_GREEN, PHASE_SIG1_YELLOW, PHASE_SIG2_GREEN, PHASE_SIG2_YELLOW };
+enum ManualColor { MANUAL_RED, MANUAL_GREEN };
+
+// ─────────────────────────────────────────────
+//  STATE
+// ─────────────────────────────────────────────
+struct State {
+  SystemMode    mode           = MODE_AUTO;
+  TrafficPhase  phase          = PHASE_SIG1_GREEN;
+  ManualColor   manualColor    = MANUAL_RED;
+  unsigned long ambulanceEndMs = 0;
+
+  // Server state
+  char          serverStr[16]  = "CONNECTING";
+  bool          serverOnline   = false;
+  unsigned long lastPollMs     = 0;
+  unsigned long lastWifiRetryMs= 0;
+  int           failCount      = 0;          // consecutive failures
+
+  // Ultrasonic
+  int           densityCm      = 999;
+  unsigned long lastSonicMs    = 0;
+
+  // Phase timer
+  unsigned long phaseStartMs   = 0;
+
+  // Button
+  bool          btnLast         = HIGH;
+  unsigned long lastPressMs     = 0;
+  int           pressCount      = 0;
+  unsigned long firstPressMs    = 0;
+
+} S;
+
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+
+// ═══════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n[BOOT] Smart Ambulance Traffic Control v7");
+
+  initPins();
+  initOLED();
+
+  // Show boot message on OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Smart Ambulance v7");
+  display.println("Connecting to WiFi...");
+  display.println("");
+  display.print("SSID: ");
+  display.println(WIFI_SSID);
+  display.display();
+
+  connectWiFi();
+
+  S.phaseStartMs = millis();
+  Serial.println("[BOOT] System ready.");
+}
+
+// ═══════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════
+void loop() {
+  unsigned long now = millis();
+
+  // Auto-retry WiFi every 30 seconds if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - S.lastWifiRetryMs >= WIFI_RETRY_MS) {
+      S.lastWifiRetryMs = now;
+      Serial.println("[WIFI] Disconnected — retrying...");
+      connectWiFi();
+    }
+  }
+
+  readButton(now);
+
+  if (S.mode != MODE_MANUAL) {
+    pollServer(now);
+    expireAmbulance(now);
+  }
+
+  measureDensity(now);
+  driveOutputs(now);
+  updateDisplay(now);
+  delay(10);
+}
+
+// ─────────────────────────────────────────────
+//  INIT HELPERS
+// ─────────────────────────────────────────────
+void initPins() {
+  const int outs[] = {
+    SIG1_RED, SIG1_YLW, SIG1_GRN,
+    SIG2_RED, SIG2_YLW, SIG2_GRN,
+    BUZZER_PIN, TRIG_PIN
+  };
+  for (int p : outs) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BTN_PIN,  INPUT_PULLUP);
+  Serial.println("[INIT] Pins OK");
+}
+
+void initOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("[WARN] OLED not found");
+    return;
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Booting...");
+  display.display();
+  Serial.println("[INIT] OLED OK");
+}
+
+// ─────────────────────────────────────────────
+//  WIFI — Connect to phone hotspot
+//  Android hotspot: typically 192.168.43.1
+//  iPhone  hotspot: typically 172.20.10.1
+//  Windows mobile hotspot: 192.168.137.1
+// ─────────────────────────────────────────────
+void connectWiFi() {
+  Serial.printf("[WIFI] Connecting to hotspot \"%s\"\n", WIFI_SSID);
+
+  WiFi.disconnect(true);
+  delay(300);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  // Wait up to 15 seconds
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    S.serverOnline = false;   // will confirm on first poll
+    strncpy(S.serverStr, "WIFI OK", sizeof(S.serverStr));
+    S.failCount    = 0;
+    Serial.printf("[WIFI] Connected — IP: %s | Signal: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    Serial.printf("[WIFI] PC server: https://%s:%d/signal?id=%s\n",
+                  SERVER_HOST, SIGNAL_ID);
+  } else {
+    strncpy(S.serverStr, "WIFI FAIL", sizeof(S.serverStr));
+    S.serverOnline = false;
+    Serial.printf("[WIFI] Failed to connect to \"%s\"\n", WIFI_SSID);
+    Serial.println("[WIFI] Check: hotspot name/password, hotspot enabled?");
+  }
+}
+
+// ─────────────────────────────────────────────
+//  SERVER POLLING
+//  Polls GET http://{SERVER_HOST}:5000/signal?id=S1
+//  Returns plain text: "GREEN" or "RED"
+// ─────────────────────────────────────────────
+void pollServer(unsigned long now) {
+  if (now - S.lastPollMs < SERVER_POLL_MS) return;
+  S.lastPollMs = now;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    strncpy(S.serverStr, "NO WIFI", sizeof(S.serverStr));
+    S.serverOnline = false;
+    return;
+  }
+
+char url[128];
+snprintf(url, sizeof(url), "http://%s:%d/signal?id=%s",
+         SERVER_HOST, SERVER_PORT, SIGNAL_ID);
+
+HTTPClient http;
+http.begin(url);
+http.setTimeout(10000);
+  int code = -1;
+
+  for(int i = 0; i < 2; i++) {
+    code = http.GET();
+    if(code == 200) break;
+    delay(2000); // wait and retry
+  }
+
+  if (code == 200) {
+    String body = http.getString();
+    body.trim();
+    http.end();
+
+    S.serverOnline = true;
+    S.failCount    = 0;
+
+    Serial.printf("[SERVER] %s → \"%s\"\n", SIGNAL_ID, body.c_str());
+
+    if (body.indexOf("GREEN") >= 0) {
+      strncpy(S.serverStr, "AMB GREEN", sizeof(S.serverStr));
+      if (S.mode == MODE_AUTO) {
+        S.mode           = MODE_AMBULANCE;
+        S.ambulanceEndMs = now + AMBULANCE_HOLD_MS;
+        Serial.println("[SERVER] → AMBULANCE MODE");
+      }
+    } else {
+      strncpy(S.serverStr, "NORMAL", sizeof(S.serverStr));
+      if (S.mode == MODE_AMBULANCE) {
+        returnToAuto(now);
+        Serial.println("[SERVER] → Normal (ambulance cleared)");
+      }
+    }
+
+  } else {
+    http.end();
+    S.failCount++;
+    Serial.printf("[SERVER] HTTP error: %d (fail #%d)\n", code, S.failCount);
+
+    if (S.failCount >= 3) {
+      // After 3 failures, mark server offline
+      S.serverOnline = false;
+      snprintf(S.serverStr, sizeof(S.serverStr), "ERR:%d", code > 0 ? code : -1);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+//  BUTTON — press-based control
+//  1 press  → Flip signal color (MANUAL mode only)
+//  2 presses → Toggle MANUAL ↔ AUTO mode
+// ─────────────────────────────────────────────
+void readButton(unsigned long now) {
+  bool cur = digitalRead(BTN_PIN);
+
+  // Detect falling edge (button pressed)
+  if (S.btnLast == HIGH && cur == LOW) {
+    if (now - S.lastPressMs > DEBOUNCE_MS) {
+      S.lastPressMs = now;
+
+      if (S.pressCount == 0) {
+        // First press — start timing window
+        S.firstPressMs = now;
+        S.pressCount   = 1;
+        Serial.println("[BTN] Press 1");
+      } else {
+        // Second press within window — double press
+        S.pressCount = 2;
+        Serial.println("[BTN] Press 2 (double)");
+      }
+    }
+  }
+
+  S.btnLast = cur;
+
+  // Evaluate after the double-press window expires
+  if (S.pressCount > 0 && (now - S.firstPressMs) >= DOUBLE_PRESS_MS) {
+    if (S.pressCount >= 2) {
+      onDoublePress(now);
+    } else {
+      onSinglePress(now);
+    }
+    S.pressCount = 0;
+  }
+}
+
+void onSinglePress(unsigned long now) {
+  // Single press: flip signal color (MANUAL mode only)
+  if (S.mode == MODE_MANUAL) {
+    buzzerBeep(80);
+    if (S.manualColor == MANUAL_RED) {
+      S.manualColor = MANUAL_GREEN;
+      Serial.println("[MANUAL] RED → GREEN");
+    } else {
+      S.manualColor = MANUAL_RED;
+      Serial.println("[MANUAL] GREEN → RED");
+    }
+  } else {
+    Serial.println("[BTN] Single press ignored (not in MANUAL mode)");
+  }
+}
+
+void onDoublePress(unsigned long now) {
+  // Double press: toggle MANUAL ↔ AUTO
+  buzzerBeep(150);
+  if (S.mode == MODE_MANUAL) {
+    S.mode = MODE_AUTO;
+    S.phaseStartMs = now;
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("[MODE] MANUAL → AUTO");
+  } else {
+    S.mode = MODE_MANUAL;
+    S.manualColor = MANUAL_RED;
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("[MODE] AUTO → MANUAL");
+  }
+}
+
+void expireAmbulance(unsigned long now) {
+  if (S.mode == MODE_AMBULANCE && now >= S.ambulanceEndMs) {
+    returnToAuto(now);
+    Serial.println("[MODE] Ambulance expired → AUTO");
+  }
+}
+
+void returnToAuto(unsigned long now) {
+  S.mode = MODE_AUTO; S.phaseStartMs = now;
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ─────────────────────────────────────────────
+//  ULTRASONIC
+// ─────────────────────────────────────────────
+void measureDensity(unsigned long now) {
+  if (now - S.lastSonicMs < DENSITY_SAMPLE_MS) return;
+  S.lastSonicMs = now;
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long dur = pulseIn(ECHO_PIN, HIGH, 30000UL);
+  S.densityCm = (dur == 0) ? 999 : (int)(dur * 0.034f / 2);
+}
+
+// ─────────────────────────────────────────────
+//  OUTPUTS
+// ─────────────────────────────────────────────
+void driveOutputs(unsigned long now) {
+  switch (S.mode) {
+    case MODE_MANUAL:
+      (S.manualColor == MANUAL_GREEN) ? bothGreen() : bothRed();
+      digitalWrite(BUZZER_PIN, LOW);
+      break;
+    case MODE_AMBULANCE:
+      bothGreen();
+      buzzerTick(now, 400);
+      break;
+    case MODE_AUTO:
+      runAutoCycle(now);
+      digitalWrite(BUZZER_PIN, LOW);
+      break;
+  }
+}
+
+void runAutoCycle(unsigned long now) {
+  unsigned long elapsed  = now - S.phaseStartMs;
+  unsigned long greenDur = (S.densityCm < 30)
+                           ? (unsigned long)(GREEN_PHASE_MS * 1.5f)
+                           : GREEN_PHASE_MS;
+
+  switch (S.phase) {
+    case PHASE_SIG1_GREEN:
+      setSignal(SIG1_RED,SIG1_YLW,SIG1_GRN, false,false,true);
+      setSignal(SIG2_RED,SIG2_YLW,SIG2_GRN, true,false,false);
+      if (elapsed >= greenDur) nextPhase(now);
+      break;
+    case PHASE_SIG1_YELLOW:
+      setSignal(SIG1_RED,SIG1_YLW,SIG1_GRN, false,true,false);
+      setSignal(SIG2_RED,SIG2_YLW,SIG2_GRN, true,false,false);
+      if (elapsed >= YELLOW_PHASE_MS) nextPhase(now);
+      break;
+    case PHASE_SIG2_GREEN:
+      setSignal(SIG1_RED,SIG1_YLW,SIG1_GRN, true,false,false);
+      setSignal(SIG2_RED,SIG2_YLW,SIG2_GRN, false,false,true);
+      if (elapsed >= greenDur) nextPhase(now);
+      break;
+    case PHASE_SIG2_YELLOW:
+      setSignal(SIG1_RED,SIG1_YLW,SIG1_GRN, true,false,false);
+      setSignal(SIG2_RED,SIG2_YLW,SIG2_GRN, false,true,false);
+      if (elapsed >= YELLOW_PHASE_MS) nextPhase(now);
+      break;
+  }
+}
+
+void nextPhase(unsigned long now) {
+  S.phase = (TrafficPhase)((S.phase + 1) % 4);
+  S.phaseStartMs = now;
+}
+
+void setSignal(int r,int y,int g,bool red,bool ylw,bool grn) {
+  digitalWrite(r, red ? HIGH : LOW);
+  digitalWrite(y, ylw ? HIGH : LOW);
+  digitalWrite(g, grn ? HIGH : LOW);
+}
+
+void bothRed()   {
+  setSignal(SIG1_RED,SIG1_YLW,SIG1_GRN,true,false,false);
+  setSignal(SIG2_RED,SIG2_YLW,SIG2_GRN,true,false,false);
+}
+
+void bothGreen() {
+  setSignal(SIG1_RED,SIG1_YLW,SIG1_GRN,false,false,true);
+  setSignal(SIG2_RED,SIG2_YLW,SIG2_GRN,false,false,true);
+}
+
+void buzzerTick(unsigned long now, unsigned long interval) {
+  static unsigned long lastMs = 0;
+  static bool on = false;
+  if (now - lastMs >= interval) { on = !on; digitalWrite(BUZZER_PIN, on); lastMs = now; }
+}
+
+void buzzerBeep(int ms) {
+  digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ─────────────────────────────────────────────
+//  OLED DISPLAY
+// ─────────────────────────────────────────────
+void updateDisplay(unsigned long now) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // Title
+  display.setCursor(0, 0);
+  display.print("SMART AMBULANCE v7");
+  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+
+  // WiFi + Server status row
+  display.setCursor(0, 12);
+  display.print("WiFi:");
+  if (WiFi.status() == WL_CONNECTED) {
+    display.print("OK ");
+    display.print(WiFi.RSSI());
+    display.print("dBm");
+  } else {
+    display.print("DISCONNECTED");
+  }
+
+  display.setCursor(0, 22);
+  display.print("Server:");
+  display.print(S.serverStr);
+
+  // Mode display
+  switch (S.mode) {
+    case MODE_MANUAL: {
+      display.setTextSize(1);
+      display.setCursor(0, 34);
+      display.println("** MANUAL MODE **");
+      display.setCursor(0, 44);
+      display.print("State: ");
+      display.println(S.manualColor == MANUAL_GREEN ? "ALL GREEN" : "ALL RED");
+      display.setCursor(0, 54);
+      display.println("1x=flip 2x=AUTO");
+      break;
+    }
+    case MODE_AMBULANCE: {
+      display.setTextSize(1);
+      display.setCursor(0, 34);
+      display.println("!! AMBULANCE MODE !!");
+      display.setCursor(0, 44);
+      display.print("Both signals: GREEN");
+      display.setCursor(0, 54);
+      unsigned long rem = (S.ambulanceEndMs > now) ? (S.ambulanceEndMs - now)/1000 : 0;
+      display.printf("Auto-clear: %lus", rem);
+      break;
+    }
+    case MODE_AUTO: {
+      const char* phLabel[] = {"SIG1 GRN","SIG1 YLW","SIG2 GRN","SIG2 YLW"};
+      display.setCursor(0, 34);
+      display.print("Phase: ");
+      display.println(phLabel[S.phase]);
+      display.setCursor(0, 44);
+      display.print("Traffic: ");
+      if      (S.densityCm <  30) display.print("HEAVY");
+      else if (S.densityCm < 100) display.print("MEDIUM");
+      else                         display.print("LIGHT");
+      display.printf(" %dcm", S.densityCm);
+      display.setCursor(0, 54);
+      display.println("2x press = MANUAL");
+      break;
+    }
+  }
+
+  display.display();
+}
+
+/*
+ * ──────────────────────────────────────────────────────
+ *  WIRING GUIDE — Traffic ESP32
+ * ──────────────────────────────────────────────────────
+ *
+ *  Signal 1 (Road A):
+ *    GPIO 23 → Red LED    (330Ω resistor)
+ *    GPIO 19 → Yellow LED (330Ω resistor)
+ *    GPIO 18 → Green LED  (330Ω resistor)
+ *
+ *  Signal 2 (Road B — crossing):
+ *    GPIO  5 → Red LED    (330Ω resistor)
+ *    GPIO 17 → Yellow LED (330Ω resistor)
+ *    GPIO 16 → Green LED  (330Ω resistor)
+ *
+ *  HC-SR04 Ultrasonic:
+ *    VCC  → 5V
+ *    GND  → GND
+ *    TRIG → GPIO 13
+ *    ECHO → GPIO 12  (use 1kΩ + 2kΩ voltage divider, or 3.3V tolerant module)
+ *
+ *  SSD1306 OLED (I2C):
+ *    VCC → 3.3V
+ *    GND → GND
+ *    SDA → GPIO 21
+ *    SCL → GPIO 22
+ *
+ *  Push Button:
+ *    One leg → GPIO 15
+ *    Other leg → GND
+ *    (Internal pull-up enabled — no resistor needed)
+ *
+ *  Buzzer (active buzzer):
+ *    + → GPIO 2
+ *    - → GND
+ */
