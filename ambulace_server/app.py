@@ -73,9 +73,9 @@ MAX_VEHICLES                = 100
 GREEN_RADIUS_M              = 300
 PASSED_RADIUS_M             = 100
 AVG_SPEED_MPS               = 10.0
-AMBULANCE_BRIGHTNESS_THRESH = 200
-AMBULANCE_BRIGHT_PIXEL_PCT  = 0.08
-AMBULANCE_CONFIDENCE_MIN    = 0.45
+AMBULANCE_BRIGHTNESS_THRESH = 240
+AMBULANCE_BRIGHT_PIXEL_PCT  = 0.30
+AMBULANCE_CONFIDENCE_MIN    = 0.85
 
 # ── Signal Nodes ──────────────────────────────────────────────────────────────
 # ★ FIX 3: S1 coordinates moved to match ambulance default GPS position
@@ -180,7 +180,7 @@ def _detect_ambulance_in_frame(frame_bytes: bytes, width: int, height: int) -> d
         avg_brightness = float(np.mean(frame))
 
         if bright_pct >= AMBULANCE_BRIGHT_PIXEL_PCT:
-            confidence = min(0.95, 0.45 + (bright_pct - 0.08) * 6.0)
+            confidence = min(0.95, 0.70 + (bright_pct - 0.30) * 2.0)
             detected   = True
         else:
             confidence = bright_pct * 5.6
@@ -387,8 +387,8 @@ def stream_frame():
     bright_detected = bright_result["detected"]
     bright_conf     = bright_result["confidence"]
 
-    detected   = yolo_detected or bright_detected
-    confidence = max(yolo_conf, bright_conf)
+    detected = yolo_detected
+    confidence = yolo_conf
 
     with _stream_lock:
         if _latest_jpeg is None:
@@ -526,7 +526,12 @@ def detect_from_cam():
         "timestamp"     : _ts(),
     }), 200
 
-
+@app.route("/db")
+def view_db():
+    return {
+        "ambulances": get_all_ambulances(),
+        "stats": get_stats()
+    }
 # ── GET /stream — MJPEG stream ────────────────────────────────────────────────
 @app.route("/stream")
 def mjpeg_stream():
